@@ -12,6 +12,7 @@ llm_memory_trial.py・schedule_metrics.py・score_pools.py と写し 3 つの単
     i. この人の条件（memory_person）: 引き方が規則どおりで、同じ種なら同じ条件・同じ生成物になる
     j. 写し元と一致: 起床・就寝の規則、平均時刻の読み込み、R1〜R4 の数え方が写し元と同じ値を返す
     k. 採点: score_pools の 20 分類の行が evaluate と同じ値になり、条件に従った割合を正しく数える
+    l. 書き直し: 選ぶ人が総当たりと一致し、採った後の誤差が増えず、記録と推移の行数が試した回数と合う
 
 g と j は DomainTransfer_trial が無い端末では飛ばす。場所は環境変数 DOMAIN_TRANSFER_ROOT で指定できる。
 
@@ -31,6 +32,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import llm_memory_trial as trial  # noqa: E402
+import rewrite_trial as rw  # noqa: E402
 import schedule_metrics as sm  # noqa: E402
 import schedule_rules as sr  # noqa: E402
 import score_pools as sp  # noqa: E402
@@ -39,6 +41,11 @@ import stula_derived_times as sdt  # noqa: E402
 tg = trial.tg
 SLEEP, MEALS, WORK, HOUSEWORK, SPORTS = 0, 2, 4, 6, 15
 SOURCE_ROOT = Path(os.environ.get("DOMAIN_TRANSFER_ROOT", HERE.parents[1] / "DomainTransfer_trial"))
+
+
+def _has_mean_times() -> bool:
+    """平均時刻の表（採点だけに使う）が置いてあるか。LLM を回すだけの端末には無くてよい"""
+    return all((tg.stula_dir() / f"{name}.csv").is_file() for name in sdt.MEANTIME_TABLES.values())
 
 
 def _seg(name_code: int, end: str) -> dict[str, str]:
@@ -242,6 +249,8 @@ def test_sources_derived_and_rules() -> None:
         "src_sa_core": SOURCE_ROOT / "src" / "models" / "SA_Aggregate" / "sa_core.py",
     }
     missing = [str(p) for p in paths.values() if not p.is_file()]
+    if not _has_mean_times():
+        missing.insert(0, "平均時刻の表（meantime_*.csv）")
     if missing:
         print(f"j. 写し元と一致: 飛ばした（{missing[0]} が無い）")
         return
@@ -288,6 +297,9 @@ def test_sources_derived_and_rules() -> None:
 
 def test_scoring() -> None:
     """k. score_pools の 20 分類の行が evaluate と同じ値になり、条件に従った割合を正しく数える"""
+    if not _has_mean_times():
+        print("k. 採点: 飛ばした（平均時刻の表 meantime_*.csv が無い）")
+        return
     d = 5
     rates, part = tg.load_rates20(), tg.load_participation20()
     with tempfile.TemporaryDirectory() as tmp:
@@ -321,6 +333,32 @@ def test_scoring() -> None:
     print("k. 採点: OK")
 
 
+def test_rewrite() -> None:
+    """l. 選ぶ人が総当たりと一致し、誤差は増えず、記録の行数が合う"""
+    d = 5
+    rates, part = tg.load_rates20()[d], tg.load_participation20()[d]
+    with tempfile.TemporaryDirectory() as tmp:
+        X0, _ = trial.generate_group(d, "none", 30, rates, part, trial.FakeChat(rates), seed=4, top_k=4, min_gap=0.03,
+                                     warmup=3, max_tries=3, log_path=Path(tmp) / "start.jsonl")
+        # 総当たり：1 人ずつ抜いて和を計算する
+        brute = [sum(rw.fit_error(np.delete(X0, j, axis=0), rates, part)) for j in range(len(X0))]
+        assert rw.pick_person(X0, rates, part, set()) == int(np.argmin(brute))
+        assert rw.pick_person(X0, rates, part, {int(np.argmin(brute))}) == int(np.argsort(brute, kind="stable")[1])
+        log_path = Path(tmp) / "rewrite.jsonl"
+        X0 = np.repeat(X0[:1], len(X0), axis=0)                 # 全員同じ 1 日（誤差が大きく、床に届かない）
+        X, curve = rw.rewrite_group(d, X0, rates, part, trial.FakeChat(rates), seed=5, top_k=4, min_gap=0.03,
+                                    person_lines=5, max_rewrites=12, cooldown=3, max_tries=3, log_path=log_path)
+        records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    total = [row["rate_mae_pt"] + row["part_mae_pt"] for row in curve]
+    assert all(b <= a + 1e-12 for a, b in zip(total, total[1:])), "採るのは和が下がるときだけ"
+    assert len(records) == 12, "床に届かなければ max_rewrites 回まで試す"
+    assert len(records) == len(curve) - 1 and curve[-1]["accepted"] == sum(r["accepted"] for r in records)
+    assert X.shape == X0.shape and int((X != X0).any(axis=1).sum()) <= int(curve[-1]["accepted"])
+    assert "This is the person's current diary:" in rw.rewrite_messages(d, X0[0], "")[1]["content"]
+    assert rw.diary_text(X0[0]).startswith("- 04:00-")
+    print(f"l. 書き直し: OK（{len(records)} 回試し、{int(curve[-1]['accepted'])} 回採った、和 {total[0]:.2f} → {total[-1]:.2f}）")
+
+
 def main() -> None:
     """全テストを順に実行する"""
     test_segments_to_slots()
@@ -334,6 +372,7 @@ def main() -> None:
     test_person_conditions()
     test_sources_derived_and_rules()
     test_scoring()
+    test_rewrite()
     print("すべて OK")
 
 
