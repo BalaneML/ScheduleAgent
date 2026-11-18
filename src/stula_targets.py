@@ -9,9 +9,9 @@ stula_targets.py
 群の番号は d = g·14 + a·2 + e（g: 0=男 1=女、a: 年齢 7 区分、e: 0=無業 1=有業）。
 
 写し元: DomainTransfer_trial の src/models/SA_Aggregate/sa_targets.py（コミット b76b51a）。
-写したのは読み込みの 2 関数・定数・round_slot_counts だけ。12 分類への対応表
-（STULA20_TO_COMMON）と、Stage 2 の教師との突き合わせ（__main__）は写していない。
-読み込みの内容を変えたときは、写し元と同じ値が返ることを確かめる。
+写したのは読み込みの 2 関数・定数・round_slot_counts と、12 分類への対応表 STULA20_TO_COMMON
+（2026-11-18 に追加。2 段階学習の生成物と同じ分類で比べるため）。Stage 2 の教師との突き合わせ
+（__main__）は写していない。読み込みや対応表を変えたときは、写し元と同じ値が返ることを確かめる。
 
 CSV の置き場所は環境変数 SCHEDULE_AGENT_STULA_DIR で指定する。
 指定しないときは、このリポジトリの data/processed/stula/ を読む。
@@ -37,6 +37,14 @@ SLOT_COLS = [f"s{j}" for j in range(NUM_SLOTS)]
 
 # 社会生活基本調査の 5 歳 15 区分 → モデルの 10 歳 7 区分
 AGE15_TO_7 = {i: min((i - 1) // 2, 6) for i in range(1, 16)}
+
+# 20 分類の番号（0 始まり, k = 活動コード − 1）→ 共通 12 分類（2 段階学習の生成物の分類）。
+# 写し元は crosswalk_atus_stula.STULA_TO_COMMON から作っている。ここでは値をそのまま書き、
+# 一致はテスト g で確かめる。12 分類の番号は 0 睡眠・身の回り 1 食事 2 仕事 3 学業 4 家事
+# 5 介護・育児 6 買い物 7 移動（通勤・通学を含む） 8 余暇・交際 9 スポーツ 10 ボランティア 11 その他
+NUM_COMMON = 12
+STULA20_TO_COMMON: npt.NDArray[np.int64] = np.array(
+    [0, 0, 1, 7, 2, 3, 4, 5, 5, 6, 7, 8, 8, 11, 8, 9, 10, 8, 11, 11], dtype=np.int64)
 
 # ★列は cast(pd.Series, ...) で Series に絞ってから map する。df["col"] はスタブ上 Series と
 #   DataFrame の union なので、辞書を渡すと DataFrame.map（callable のみ）に解決されて型の警告になる

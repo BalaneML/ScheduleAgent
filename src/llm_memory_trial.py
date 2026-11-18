@@ -1,41 +1,57 @@
 """
 llm_memory_trial.py
 ===================
-LLM が 1 人ずつ活動スケジュールを書き、生成済みの集計と集計表の差をメモリとして次の人に渡す試行（簡単な設計）
+LLM が 1 人ずつ活動スケジュールを書き、生成済みの集計と集計表の差をメモリとして次の人に渡す試行
 
-    条件 none    メモリなし。毎回同じプロンプトで 1 人ぶん書く
-    条件 memory  メモリあり。生成済みの時刻別行動者率と集計表の差が大きい箇所を、
-                 不足・超過それぞれ上位 top_k 個だけ文にして渡す
-
-書いた活動スケジュールは確定で、後から直さない。メモリは 1 人足すごとに作り直す。
+書いた活動スケジュールは確定で、後から直さない（足すだけ）。メモリは 1 人足すごとに作り直す。
 LLM には OpenAI 互換の API（llama.cpp の llama-server など）でつなぐ。プロンプトは英語。
+
+    条件 none           メモリなし。毎回同じプロンプトで 1 人ぶん書く
+    条件 memory         時刻別行動者率の差が大きい箇所を、不足・超過それぞれ上位 top_k 個だけ文にして渡す（11/17 の版）
+    条件 memory_day     日次行動者率の差（不足・超過それぞれ上位 top_k 個）と、差が大きい時間帯の
+                        「多すぎる活動・足りない活動」の組（上位 top_k 時間）を渡す。集団の数字だけ
+    条件 memory_person  memory_day に「この人の条件」を足す。日次の条件は最大 person_lines 行、時刻の組は 1 行
+
+「この人の条件」の引き方（person_conditions）: 活動 k ごとに、残りの人数で調査の値に届くのに要る実施率
+q_k = (t_k·N − H_k)/(N − n) を出し、条件を付けなかった人での実施率 b_k と比べる。q_k < b_k なら確率
+1 − q_k/b_k で「k をしない」、q_k > b_k なら確率 (q_k − b_k)/(1 − b_k) で「k をする」と書く。
 
     # サーバーなしの空回し（形式とループの確認）
     .venv/bin/python src/llm_memory_trial.py --dry-run --groups 5 --N 10 --tag dry
     # サーバーにつなぐ
-    .venv/bin/python src/llm_memory_trial.py --model-tag gemma4-12b --groups 5 0 --N 100
+    .venv/bin/python src/llm_memory_trial.py --model-tag gemma4-12b --groups 5 0 --N 100 \\
+        --conditions memory_day memory_person --tag v2
 
 出力（outputs/llm_memory_trial/{stem}/）
 
     group{d:02d}_{condition}.npz     X (N, 96) int8。20 分類・04:00 起点（DomainTransfer_trial の SA の best_X と同じ並び）
-    group{d:02d}_{condition}.jsonl   1 人 1 行。プロンプト・応答・所要時間
-    summary.csv                      群 × 条件ごとの指標
+    group{d:02d}_{condition}.jsonl   1 人 1 行。プロンプト・応答・所要時間・この人の条件（conditions）
+    summary.csv                      群 × 条件ごとの指標（較正に使う 2 表、系列、条件に従った割合）
     curve.csv                        n 人目までの時刻別行動者率の誤差
     participation.csv                日次行動者率（公表値と生成物）
 
+評価だけに残す表（平均起床・就寝時刻）と R1〜R4 の違反は、src/score_pools.py でまとめて採点する。
+
 ```mermaid
 flowchart LR
-    T["tg.load_rates20()[d]<br/>target (20, 96)"] --> M["memory_text(X_done, target, top_k, min_gap)"]
-    M --> P["build_messages(d, memory)"]
+    T["tg.load_rates20()[d]<br/>target (20, 96)"] --> M1["memory_text(X_done, target, top_k, min_gap)<br/>条件 memory"]
+    PART["tg.load_participation20()[d]<br/>part (20,)"] --> MD["memory_day_text(X_done, target, part, top_k, min_gap)<br/>条件 memory_day・memory_person"]
+    T --> MD
+    PART --> PC["person_conditions(X_done, target, part, n_people, told, u, person_lines, min_gap)<br/>conds"]
+    PC --> PT["person_text(conds)<br/>条件 memory_person"]
+    M1 --> P["build_messages(d, memory)"]
+    MD --> P
+    PT --> P
     P --> L["client.chat(messages, seed)<br/>content"]
     L --> S["segments_to_slots(segments)<br/>row (96,)"]
     S --> X["X_done に row を足す（確定）"]
-    X --> M
-    X --> E["evaluate(X, target, part)"]
-    PART["tg.load_participation20()[d]<br/>part (20,)"] --> E
+    X --> M1
+    X --> MD
+    X --> PC
+    X --> E["evaluate(X, target, part)<br/>follow_rates(X, conditions)"]
 ```
 
-★メモリに入れるのは時刻別行動者率だけ。日次行動者率（第70-3表）は LLM に見せず、評価にだけ使う。
+★較正に使うのは時刻別行動者率と日次行動者率（第70-3表）。条件 memory だけは 11/17 の版のまま、時刻別だけを見る。
 """
 import argparse
 import json
@@ -43,7 +59,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import numpy as np
 import numpy.typing as npt
@@ -52,6 +68,7 @@ import pandas as pd
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import stula_targets as tg  # noqa: E402
+from schedule_metrics import error_curve, evaluate, follow_rates, participation, slot_rates  # noqa: E402
 
 OUT_ROOT = tg.REPO_ROOT / "outputs" / "llm_memory_trial"
 
@@ -59,7 +76,7 @@ SLOT_MIN = 15                 # 1 スロットの長さ（分）
 DAY_MIN = 24 * 60
 ORIGIN_MIN = 4 * 60           # スロット 0 は 04:00〜04:15（parse_timeband.py の回転と同じ）
 SLOTS_PER_HOUR = 60 // SLOT_MIN
-CONDITIONS = ("none", "memory")
+CONDITIONS = ("none", "memory", "memory_day", "memory_person")
 
 # 社会生活基本調査 2021 調査票 A（英語版）の「Kind of activities」の表記。並びは活動コード 1〜20
 ACTIVITY_NAMES: list[str] = [
@@ -138,6 +155,8 @@ EMPLOY_TEXT = [
     "who usually does not work (for example: attends school, does housework, or other)",
     "who usually works (work for pay or profit, including part-time work and helping in a family business)",
 ]
+CLOSING_TEXT = ["Choose this person's day so that the group as a whole moves closer to the survey statistics,",
+                "while the day stays realistic for one person."]
 
 
 class Chat(Protocol):
@@ -216,6 +235,21 @@ class FakeChat:
         return json.dumps({"segments": slots_to_segments(row)}), {"usage": {}, "timings": {}}
 
 
+class SwapPair(NamedTuple):
+    """ある時間帯の「多すぎる活動」と「足りない活動」の組
+
+    Attributes:
+        hour: 04:00 起点の時間の番号（0 が 04:00〜05:00）
+        over: 多すぎる活動の番号
+        under: 足りない活動の番号
+        size: 組の差の大きさ。多すぎる側と足りない側の差の小さい方（割合）
+    """
+    hour: int
+    over: int
+    under: int
+    size: float
+
+
 def clock(minutes_from_origin: int) -> str:
     """04:00 からの経過分を HH:MM にする（1440 分は 04:00）"""
     m = (ORIGIN_MIN + minutes_from_origin) % DAY_MIN
@@ -282,16 +316,18 @@ def hourly_mean(rates: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
     return rates.reshape(tg.NUM_ACT20, 24, SLOTS_PER_HOUR).mean(axis=2)
 
 
-def slot_rates(X: npt.NDArray[np.int8]) -> npt.NDArray[np.float64]:
-    """生成済みの活動スケジュール (n, 96) から時刻別行動者率 (20, 96) を集計する"""
-    rates = np.zeros((tg.NUM_ACT20, tg.NUM_SLOTS))
-    for k in range(tg.NUM_ACT20):
-        rates[k] = (X == k).mean(axis=0)
-    return rates
+def hour_label(hour: int) -> str:
+    """04:00 起点の時間の番号を「HH:MM-HH:MM」にする"""
+    return f"{clock(hour * 60)}-{clock((hour + 1) * 60)}"
+
+
+def clock_hour(hour: int) -> int:
+    """04:00 起点の時間の番号を、時計の時（0〜23）にする"""
+    return (ORIGIN_MIN // 60 + hour) % 24
 
 
 def memory_text(X_done: npt.NDArray[np.int8], target: npt.NDArray[np.float64], top_k: int, min_gap: float) -> str:
-    """メモリの文章を作る。生成済みの集計と集計表の差が大きい箇所を、不足・超過それぞれ上位 top_k 個
+    """条件 memory のメモリ（11/17 の版）。時刻別行動者率の差が大きい箇所を、不足・超過それぞれ上位 top_k 個
 
     差は 1 時間ごとの平均で比べる（20 活動 × 24 時間）。
 
@@ -315,7 +351,7 @@ def memory_text(X_done: npt.NDArray[np.int8], target: npt.NDArray[np.float64], t
             k, h = divmod(int(flat), 24)
             if sign * gap[k, h] < min_gap:
                 break
-            out.append(f"- {ACTIVITY_NAMES[k]}, {clock(h * 60)}-{clock((h + 1) * 60)}: "
+            out.append(f"- {ACTIVITY_NAMES[k]}, {hour_label(h)}: "
                        f"survey {want[k, h]:.0%}, diaries so far {have[k, h]:.0%}")
         return out
 
@@ -328,9 +364,155 @@ def memory_text(X_done: npt.NDArray[np.int8], target: npt.NDArray[np.float64], t
         text += ["Too FEW people so far are doing:"] + too_few
     if too_many:
         text += ["Too MANY people so far are doing:"] + too_many
-    text += ["Choose this person's day so that the group as a whole moves closer to the survey statistics,",
-             "while the day stays realistic for one person."]
+    text += CLOSING_TEXT
     return "\n".join(text)
+
+
+def hour_swap_pairs(X_done: npt.NDArray[np.int8], target: npt.NDArray[np.float64], top_k: int,
+                    min_gap: float) -> list[SwapPair]:
+    """時間帯ごとに「最も多すぎる活動」と「最も足りない活動」の組を作り、組の差が大きい順に top_k 個
+
+    組の差は、多すぎる側の差と足りない側の差の小さい方。1 人がその時間帯の活動を入れ替えると、
+    両方の差が同時に縮む。
+
+    Args:
+        X_done: (n, 96) これまでに確定した活動スケジュール
+        target: (20, 96) 集計表の時刻別行動者率
+        top_k: 挙げる組の数の上限
+        min_gap: 組の差がこれより小さい時間帯は挙げない（割合）
+
+    Returns:
+        SwapPair の並び（組の差が大きい順）
+    """
+    gap = hourly_mean(slot_rates(X_done)) - hourly_mean(target)     # (20, 24)
+    hours = np.arange(24)
+    over, under = gap.argmax(axis=0), gap.argmin(axis=0)
+    size = np.minimum(gap[over, hours], -gap[under, hours])
+    pairs: list[SwapPair] = []
+    for h in np.argsort(-size, kind="stable")[:top_k]:
+        if size[h] < min_gap:
+            break
+        pairs.append(SwapPair(int(h), int(over[h]), int(under[h]), float(size[h])))
+    return pairs
+
+
+def memory_day_text(X_done: npt.NDArray[np.int8], target: npt.NDArray[np.float64], part: npt.NDArray[np.float64],
+                    top_k: int, min_gap: float) -> str:
+    """条件 memory_day のメモリ。日次行動者率の差と、時間帯ごとの「多すぎる・足りない」の組。集団の数字だけ
+
+    Args:
+        X_done: (n, 96) これまでに確定した活動スケジュール
+        target: (20, 96) 集計表の時刻別行動者率
+        part: (20,) 日次行動者率の公表値
+        top_k: 日次は不足・超過それぞれ、時間帯は組の数で、挙げる個数の上限
+        min_gap: これより差の小さい箇所は挙げない（割合）
+
+    Returns:
+        英語の文章。挙げる箇所が 1 つも無いときは空文字
+    """
+    have = participation(X_done)
+    gap = have - part
+    order = np.argsort(-np.abs(gap), kind="stable")
+    many = [int(k) for k in order if gap[k] >= min_gap][:top_k]
+    few = [int(k) for k in order if -gap[k] >= min_gap][:top_k]
+    pairs = hour_swap_pairs(X_done, target, top_k, min_gap)
+    if not many and not few and not pairs:
+        return ""
+    want_h, have_h = hourly_mean(target), hourly_mean(slot_rates(X_done))
+    text = [f"MEMORY. {len(X_done)} diaries have been written for this group so far. Compared with the",
+            "official survey statistics:"]
+    if many or few:
+        text.append("Share of people who do the activity at some time in the day:")
+        if many:
+            text += ["Too MANY people so far are doing:"]
+            text += [f"- {ACTIVITY_NAMES[k]}: survey {part[k]:.0%}, diaries so far {have[k]:.0%}" for k in many]
+        if few:
+            text += ["Too FEW people so far are doing:"]
+            text += [f"- {ACTIVITY_NAMES[k]}: survey {part[k]:.0%}, diaries so far {have[k]:.0%}" for k in few]
+    if pairs:
+        text.append("Hours with the largest differences (share of people doing the activity in that hour):")
+        for p in pairs:
+            text.append(f"- {hour_label(p.hour)}: too many doing {ACTIVITY_NAMES[p.over]} "
+                        f"(survey {want_h[p.over, p.hour]:.0%}, diaries so far {have_h[p.over, p.hour]:.0%}), "
+                        f"too few doing {ACTIVITY_NAMES[p.under]} "
+                        f"(survey {want_h[p.under, p.hour]:.0%}, diaries so far {have_h[p.under, p.hour]:.0%})")
+    text += CLOSING_TEXT
+    return "\n".join(text)
+
+
+def person_conditions(X_done: npt.NDArray[np.int8], target: npt.NDArray[np.float64], part: npt.NDArray[np.float64],
+                      n_people: int, told: npt.NDArray[np.int8], u: npt.NDArray[np.float64], person_lines: int,
+                      min_gap: float) -> list[dict[str, Any]]:
+    """次の 1 人に付ける条件を引く（条件 memory_person）
+
+    日次の条件: 生成済みの日次行動者率が公表値と min_gap 以上違う活動 k について、残りの人数で
+    公表値に届くのに要る実施率 q_k = (t_k·N − H_k)/(N − n) を出す（0〜1 に収める）。条件を付けなかった人で
+    の実施率 b_k と比べ、q_k < b_k なら確率 1 − q_k/b_k で「k をしない」、q_k > b_k なら確率
+    (q_k − b_k)/(1 − b_k) で「k をする」を付ける。LLM が条件に従い、条件の無い人が b_k の率で k をするなら、
+    N 人目で日次行動者率が公表値に届く。付いた条件が person_lines を超えたら |q_k − b_k| の小さい方から落とす。
+
+    時刻の条件: hour_swap_pairs の組を差の大きい順に見て、日次の条件と矛盾しない最初の 1 組を
+    「その時間帯は足りない活動をしている（多すぎる活動ではない）」として付ける。
+
+    Args:
+        X_done: (n, 96) これまでに確定した活動スケジュール
+        target: (20, 96) 集計表の時刻別行動者率
+        part: (20,) 日次行動者率の公表値
+        n_people: 群で書く人数 N
+        told: (n, 20) これまでの人に付けた日次の条件。+1 = する、−1 = しない、0 = 条件なし
+        u: (20,) この人のための一様乱数。活動 k の条件を付けるかは u[k] < 確率 で決める
+        person_lines: 日次の条件の数の上限
+        min_gap: 日次・時刻とも、これより差の小さい箇所には条件を付けない（割合）
+
+    Returns:
+        条件の並び。{"kind": "not" | "do", "activity": k, "priority": |q_k − b_k|} と
+        {"kind": "swap", "activity": 足りない活動, "instead_of": 多すぎる活動, "hour": 時計の時}
+    """
+    n = len(X_done)
+    present = np.stack([(X_done == k).any(axis=1) for k in range(tg.NUM_ACT20)], axis=1)   # (n, 20)
+    have = present.mean(axis=0)
+    conds: list[dict[str, Any]] = []
+    for k in range(tg.NUM_ACT20):
+        if abs(have[k] - part[k]) < min_gap:
+            continue
+        q = float(np.clip((part[k] * n_people - present[:, k].sum()) / (n_people - n), 0.0, 1.0))
+        free = told[:n, k] == 0
+        b = float(present[free, k].mean()) if free.any() else float(have[k])
+        if q < b:
+            kind, prob = "not", 1.0 - q / b
+        elif q > b and b < 1.0:
+            kind, prob = "do", (q - b) / (1.0 - b)
+        else:
+            continue
+        if u[k] < prob:
+            conds.append({"kind": kind, "activity": k, "priority": round(abs(q - b), 4)})
+    conds = sorted(conds, key=lambda c: -c["priority"])[:person_lines]
+    excluded = {c["activity"] for c in conds if c["kind"] == "not"}
+    for p in hour_swap_pairs(X_done, target, 24, min_gap):
+        if p.under in excluded:
+            continue
+        conds.append({"kind": "swap", "activity": p.under, "instead_of": p.over, "hour": clock_hour(p.hour)})
+        break
+    return conds
+
+
+def person_text(conds: list[dict[str, Any]]) -> str:
+    """「この人の条件」を英語の文にする。条件が無いときは空文字"""
+    if not conds:
+        return ""
+    lines = ["This person (so that the group moves closer to the survey):"]
+    for c in conds:
+        name = ACTIVITY_NAMES[c["activity"]]
+        if c["kind"] == "not":
+            lines.append(f"- does not do {name} at any time today.")
+        elif c["kind"] == "do":
+            lines.append(f"- does {name} at some time today.")
+        else:
+            h = int(c["hour"])
+            lines.append(f"- During {h:02d}:00-{(h + 1) % 24:02d}:00 this person is doing {name}, "
+                         f"not {ACTIVITY_NAMES[c['instead_of']]}.")
+    lines.append("Keep the rest of the day realistic for this person.")
+    return "\n".join(lines)
 
 
 def group_text(d: int) -> str:
@@ -345,7 +527,7 @@ def build_messages(d: int, memory: str) -> list[dict[str, str]]:
 
     Args:
         d: 群の番号
-        memory: memory_text の文章。メモリなしのときは空文字
+        memory: メモリの文章。メモリなしのときは空文字
 
     Returns:
         system と user のメッセージ
@@ -358,33 +540,51 @@ def build_messages(d: int, memory: str) -> list[dict[str, str]]:
     return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": "\n".join(user)}]
 
 
-def generate_group(d: int, condition: str, n_people: int, target: npt.NDArray[np.float64], client: Chat,
-                   seed: int, top_k: int, min_gap: float, warmup: int, max_tries: int,
-                   log_path: Path) -> npt.NDArray[np.int8]:
+def generate_group(d: int, condition: str, n_people: int, target: npt.NDArray[np.float64],
+                   part: npt.NDArray[np.float64], client: Chat, seed: int, top_k: int, min_gap: float, warmup: int,
+                   max_tries: int, log_path: Path,
+                   person_lines: int = 5) -> tuple[npt.NDArray[np.int8], list[list[dict[str, Any]]]]:
     """1 群ぶんを 1 人ずつ生成する。書いた活動スケジュールは確定で、後から直さない
 
     Args:
         d: 群の番号
-        condition: "none"（メモリなし）か "memory"（メモリあり）
+        condition: CONDITIONS のどれか
         n_people: 生成する人数 N
         target: (20, 96) 集計表の時刻別行動者率
+        part: (20,) 日次行動者率の公表値（memory_day・memory_person で使う）
         client: LLM への問い合わせ
-        seed: 種。i 人目の try 回目は seed · 100000 + i · 10 + try を使う
-        top_k: メモリに挙げる個数（不足・超過それぞれ）
+        seed: 種。i 人目の try 回目は seed · 100000 + i · 10 + try を使う。条件を引く乱数は (seed, d, 条件の番号) から作る
+        top_k: メモリに挙げる個数
         min_gap: メモリに挙げる差の下限
-        warmup: この人数までは、メモリありでもメモリを渡さない（集計が粗すぎるため）
+        warmup: この人数までは、どの条件でもメモリを渡さない（集計が粗すぎるため）
         max_tries: 形式が正しくないときにやり直す回数の上限。超えたら直して採用する
         log_path: 1 人 1 行の記録の書き出し先（jsonl）
+        person_lines: memory_person の日次の条件の数の上限
 
     Returns:
-        X (N, 96) int8
+        X (N, 96) int8 と、人ごとに付けた条件の並び（memory_person 以外は空の並び）
     """
     X = np.empty((n_people, tg.NUM_SLOTS), dtype=np.int8)
+    told = np.zeros((n_people, tg.NUM_ACT20), dtype=np.int8)
+    conditions: list[list[dict[str, Any]]] = []
+    rng = np.random.default_rng([seed, d, CONDITIONS.index(condition)])
     with open(log_path, "w", encoding="utf-8") as log:
         for i in range(n_people):
             memory = ""
-            if condition == "memory" and i >= warmup:
-                memory = memory_text(X[:i], target, top_k, min_gap)
+            conds: list[dict[str, Any]] = []
+            u = rng.random(tg.NUM_ACT20)              # 人ごとに必ず 20 個引く（条件の有無で乱数の並びがずれない）
+            if i >= warmup:
+                if condition == "memory":
+                    memory = memory_text(X[:i], target, top_k, min_gap)
+                elif condition in ("memory_day", "memory_person"):
+                    memory = memory_day_text(X[:i], target, part, top_k, min_gap)
+                    if condition == "memory_person":
+                        conds = person_conditions(X[:i], target, part, n_people, told, u, person_lines, min_gap)
+                        memory = "\n\n".join(t for t in (memory, person_text(conds)) if t)
+            for c in conds:
+                if c["kind"] in ("not", "do"):
+                    told[i, c["activity"]] = 1 if c["kind"] == "do" else -1
+            conditions.append(conds)
             messages = build_messages(d, memory)
             row, problem, content, meta, tries = None, "", "", {}, 0
             t0 = time.time()
@@ -401,79 +601,25 @@ def generate_group(d: int, condition: str, n_people: int, target: npt.NDArray[np
             X[i] = row
             sec = time.time() - t0
             log.write(json.dumps({"group": d, "condition": condition, "i": i, "tries": tries, "repaired": bool(problem),
-                                  "problem": problem, "seconds": round(sec, 2), "memory": memory, "content": content,
-                                  **meta}, ensure_ascii=False) + "\n")
+                                  "problem": problem, "seconds": round(sec, 2), "memory": memory,
+                                  "conditions": conds, "content": content, **meta}, ensure_ascii=False) + "\n")
             log.flush()
-            print(f"[llm] 群 {d:02d} {condition:<6} {i + 1:>4}/{n_people}  {sec:6.1f} 秒  try {tries}"
+            print(f"[llm] 群 {d:02d} {condition:<13} {i + 1:>4}/{n_people}  {sec:6.1f} 秒  try {tries}"
                   f"{'  直した: ' + problem if problem else ''}", flush=True)
-    return X
-
-
-def evaluate(X: npt.NDArray[np.int8], target: npt.NDArray[np.float64],
-             part: npt.NDArray[np.float64]) -> dict[str, float]:
-    """1 群ぶんの生成物を採点する
-
-    Args:
-        X: (N, 96) 生成した活動スケジュール
-        target: (20, 96) 集計表の時刻別行動者率（メモリに使った表）
-        part: (20,) 日次行動者率の公表値（LLM に見せていない表）
-
-    Returns:
-        指標の名前 → 値。_pt はポイント（割合 × 100）
-    """
-    n_people = len(X)
-    err = slot_rates(X) - target
-    change = X[:, 1:] != X[:, :-1]
-    # 1 スロットだけで終わる区間：両側が切り替わっているスロット（端は片側だけ見る）
-    edge = np.concatenate([np.ones((n_people, 1), dtype=bool), change, np.ones((n_people, 1), dtype=bool)], axis=1)
-    single = edge[:, :-1] & edge[:, 1:]
-    n_episodes = change.sum() + n_people
-    part_hat = np.array([(X == k).any(axis=1).mean() for k in range(tg.NUM_ACT20)])
-    counts = np.stack([(X == k).sum(axis=0) for k in range(tg.NUM_ACT20)])
-    over = np.maximum(counts - tg.round_slot_counts(target, n_people), 0).sum()
-    return {
-        "rate_mae_pt": float(np.abs(err).mean() * 100),
-        "rate_rmse_pt": float(np.sqrt((err ** 2).mean()) * 100),
-        "switches_mean": float(change.sum(axis=1).mean()),
-        "single_slot_share": float(single.sum() / n_episodes),
-        "part_mae_pt": float(np.abs(part_hat - part).mean() * 100),
-        "n_unique": float(len(np.unique(X, axis=0))),
-        "overfill_share": float(over / (n_people * tg.NUM_SLOTS)),
-    }
-
-
-def error_curve(X: npt.NDArray[np.int8], target: npt.NDArray[np.float64], step: int) -> list[dict[str, float]]:
-    """最初の n 人だけで集計したときの時刻別行動者率の誤差を、n を step ずつ増やして並べる
-
-    floor_mae_pt は、集計表どおりの分布から n 人を独立に引いたときの誤差の期待値（正規近似）。
-    生成物の誤差がこれより小さければ、独立に引くよりも集計表に合っている。
-
-    Args:
-        X: (N, 96) 生成した順に並んだ活動スケジュール
-        target: (20, 96) 集計表の時刻別行動者率
-        step: n の刻み
-
-    Returns:
-        [{"n": n, "rate_mae_pt": ..., "floor_mae_pt": ...}, ...]
-    """
-    rows: list[dict[str, float]] = []
-    for n in sorted(set(range(step, len(X) + 1, step)) | {len(X)}):
-        floor = np.sqrt(2.0 * target * (1.0 - target) / (np.pi * n)).mean() * 100
-        rows.append({"n": float(n), "rate_mae_pt": float(np.abs(slot_rates(X[:n]) - target).mean() * 100),
-                     "floor_mae_pt": float(floor)})
-    return rows
+    return X, conditions
 
 
 def main() -> None:
     """CLI"""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--groups", type=int, nargs="+", default=[5, 0], help="生成する群の番号")
-    ap.add_argument("--conditions", nargs="+", choices=CONDITIONS, default=list(CONDITIONS))
+    ap.add_argument("--conditions", nargs="+", choices=CONDITIONS, default=["none", "memory"])
     ap.add_argument("--N", type=int, default=100, help="群あたりの人数")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--top-k", type=int, default=6, help="メモリに挙げる個数（不足・超過それぞれ）")
-    ap.add_argument("--min-gap", type=float, default=0.03, help="メモリに挙げる差の下限（割合）")
+    ap.add_argument("--top-k", type=int, default=6, help="メモリに挙げる個数")
+    ap.add_argument("--min-gap", type=float, default=0.03, help="メモリに挙げる差・条件を付ける差の下限（割合）")
     ap.add_argument("--warmup", type=int, default=5, help="この人数まではメモリを渡さない")
+    ap.add_argument("--person-lines", type=int, default=5, help="memory_person の日次の条件の数の上限")
     ap.add_argument("--max-tries", type=int, default=3, help="形式が正しくないときにやり直す回数の上限")
     ap.add_argument("--base-url", default="http://127.0.0.1:8080", help="OpenAI 互換のサーバーの URL")
     ap.add_argument("--model-tag", default="dry", help="保存名に入れるモデルの呼び名（例 gemma4-12b）")
@@ -504,11 +650,13 @@ def main() -> None:
                 args.base_url, args.model_tag, args.temperature, args.top_p, args.max_tokens,
                 json.loads(args.extra_json))
             t0 = time.time()
-            X = generate_group(d, condition, args.N, target, client, args.seed, args.top_k, args.min_gap,
-                               args.warmup, args.max_tries, out_dir / f"group{d:02d}_{condition}.jsonl")
+            X, conditions = generate_group(d, condition, args.N, target, part20[d], client, args.seed, args.top_k,
+                                           args.min_gap, args.warmup, args.max_tries,
+                                           out_dir / f"group{d:02d}_{condition}.jsonl", args.person_lines)
             np.savez_compressed(out_dir / f"group{d:02d}_{condition}.npz", X=X)
             key = {"stem": stem, "group": d, "condition": condition}
-            summary.append({**key, "n_people": args.N, **evaluate(X, target, part20[d]),
+            follow = follow_rates(X, conditions) if condition == "memory_person" else {}
+            summary.append({**key, "n_people": args.N, **evaluate(X, target, part20[d]), **follow,
                             "minutes": (time.time() - t0) / 60})
             curves += [{**key, **row} for row in error_curve(X, target, step=10)]
             parts += [{**key, "activity": ACTIVITY_NAMES[k], "published": float(part20[d, k]),
