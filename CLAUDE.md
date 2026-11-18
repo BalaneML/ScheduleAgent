@@ -66,3 +66,5 @@ When you are using compact, please focus on test output and code changes
   - 図の中で使用する変数名はコード中の変数名と一致させること
   - モデルの構造や処理の流れを図示すること
 - docstringはGoogle styleで記述すること
+- 実験結果について後から確認しやすいよう実装してください．
+- 実験結果について後から確認しやすいように出力を構成してください
