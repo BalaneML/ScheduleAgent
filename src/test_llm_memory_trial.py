@@ -12,7 +12,7 @@ llm_memory_trial.py・schedule_metrics.py・score_pools.py と写し 3 つの単
     i. この人の条件（memory_person）: 引き方が規則どおりで、同じ種なら同じ条件・同じ生成物になる
     j. 写し元と一致: 起床・就寝の規則、平均時刻の読み込み、R1〜R4 の数え方が写し元と同じ値を返す
     k. 採点: score_pools の 20 分類の行が evaluate と同じ値になり、条件に従った割合を正しく数える
-    l. 書き直し: 選ぶ人が総当たりと一致し、採った後の誤差が増えず、記録と推移の行数が試した回数と合う
+    l. 書き直し: 選ぶ人が総当たりと一致し、選ぶ範囲が広く → 狭く変わり、採った後の誤差が増えず、記録と推移の行数が合う
 
 g と j は DomainTransfer_trial が無い端末では飛ばす。場所は環境変数 DOMAIN_TRANSFER_ROOT で指定できる。
 
@@ -342,18 +342,41 @@ def test_rewrite() -> None:
                                      warmup=3, max_tries=3, log_path=Path(tmp) / "start.jsonl")
         # 総当たり：1 人ずつ抜いて和を計算する
         brute = [sum(rw.fit_error(np.delete(X0, j, axis=0), rates, part)) for j in range(len(X0))]
-        assert rw.pick_person(X0, rates, part, set()) == int(np.argmin(brute))
-        assert rw.pick_person(X0, rates, part, {int(np.argmin(brute))}) == int(np.argsort(brute, kind="stable")[1])
-        log_path = Path(tmp) / "rewrite.jsonl"
+        scores = rw.removal_scores(X0, rates, part)
+        assert np.allclose(scores, brute)
+        rng = np.random.default_rng(0)
+        assert rw.pick_person(scores, set(), 1, rng) == int(np.argmin(brute))
+        assert rw.pick_person(scores, {int(np.argmin(brute))}, 1, rng) == int(np.argsort(brute, kind="stable")[1])
+        # m = N なら recent 以外の全員から一様に選ぶ（偏らない）
+        picks = {rw.pick_person(scores, {0, 1}, len(X0), rng) for _ in range(400)}
+        assert picks == set(range(2, len(X0))), "m = N で 400 回選べば recent 以外の全員が出る"
+        top3 = set(int(j) for j in np.argsort(scores, kind="stable")[:3])
+        assert {rw.pick_person(scores, set(), 3, rng) for _ in range(100)} == top3
+        # 選ぶ範囲は m_start から m_end へ単調に狭まる
+        widths = [rw.select_width(t, 100, 100, 1) for t in range(100)]
+        assert widths[0] == 100 and widths[-1] == 1 and all(b <= a for a, b in zip(widths, widths[1:]))
+        assert [widths[t] for t in (25, 50, 75)] == [31, 10, 3]
         X0 = np.repeat(X0[:1], len(X0), axis=0)                 # 全員同じ 1 日（誤差が大きく、床に届かない）
-        X, curve = rw.rewrite_group(d, X0, rates, part, trial.FakeChat(rates), seed=5, top_k=4, min_gap=0.03,
-                                    person_lines=5, max_rewrites=12, cooldown=3, max_tries=3, log_path=log_path)
-        records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+        runs = {}
+        for select in ("best", "shrink"):
+            log_path = Path(tmp) / f"rewrite_{select}.jsonl"
+            X, curve = rw.rewrite_group(d, X0, rates, part, trial.FakeChat(rates), seed=5, top_k=4, min_gap=0.03,
+                                        person_lines=5, max_rewrites=12, cooldown=3, max_tries=3, log_path=log_path,
+                                        select=select)
+            records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+            runs[select] = (X, curve, records)
+    for select, (X, curve, records) in runs.items():
+        total = [row["rate_mae_pt"] + row["part_mae_pt"] for row in curve]
+        assert all(b <= a + 1e-12 for a, b in zip(total, total[1:])), f"{select}: 採るのは和が下がるときだけ"
+        assert len(records) == 12, "床に届かなければ max_rewrites 回まで試す"
+        assert len(records) == len(curve) - 1 and curve[-1]["accepted"] == sum(r["accepted"] for r in records)
+        assert X.shape == X0.shape and int((X != X0).any(axis=1).sum()) <= int(curve[-1]["accepted"])
+        assert curve[-1]["distinct_tried"] == len({r["person"] for r in records})
+    assert all(r["width"] == 1 for r in runs["best"][2])
+    shrink_widths = [r["width"] for r in runs["shrink"][2]]
+    assert shrink_widths[0] == 30 and shrink_widths[-1] == 1, "shrink は群の人数から 1 へ狭める"
+    X, curve, records = runs["shrink"]
     total = [row["rate_mae_pt"] + row["part_mae_pt"] for row in curve]
-    assert all(b <= a + 1e-12 for a, b in zip(total, total[1:])), "採るのは和が下がるときだけ"
-    assert len(records) == 12, "床に届かなければ max_rewrites 回まで試す"
-    assert len(records) == len(curve) - 1 and curve[-1]["accepted"] == sum(r["accepted"] for r in records)
-    assert X.shape == X0.shape and int((X != X0).any(axis=1).sum()) <= int(curve[-1]["accepted"])
     assert "This is the person's current diary:" in rw.rewrite_messages(d, X0[0], "")[1]["content"]
     assert rw.diary_text(X0[0]).startswith("- 04:00-")
     print(f"l. 書き直し: OK（{len(records)} 回試し、{int(curve[-1]['accepted'])} 回採った、和 {total[0]:.2f} → {total[-1]:.2f}）")

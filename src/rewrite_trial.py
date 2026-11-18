@@ -6,8 +6,10 @@ rewrite_trial.py
 出発点は llm_memory_trial の出力（既定は memory_person の 100 人）。素の生成能力と書き直しの効果を、
 同じ人たちで比べられる。1 回の書き直しは次のとおり。
 
-    1. 選ぶ    その人を抜いたときに、時刻別 MAE と日次 MAE の和（重み 1:1）が最も下がる人をコードが選ぶ。
-               直近 cooldown 回に書き直しを試した人は選ばない（同じ人を何度も選び続けないため）
+    1. 選ぶ    その人を抜いたときの時刻別 MAE と日次 MAE の和（重み 1:1）を全員について出し、小さい順の
+               上位 m_t 人から一様に 1 人選ぶ。直近 cooldown 回に試した人は選ばない。
+               select=best は常に m_t = 1（和が最も下がる人）。select=shrink は SA の幾何的な冷却と同じ形で
+               m_t = round(m_start · (m_end / m_start)^(t / (T − 1))) と、範囲を広く → 狭くする
     2. 書かせる その人の今の 1 日と、その人を抜いた集団のメモリ（memory_day の文）と、その人の条件
                （person_conditions を「残り 1 人」として呼ぶ）を LLM に渡し、1 日を書き直させる
     3. 採る    書き直した 1 日に入れ替えたとき、和が下がれば採る。下がらなければ元の 1 日に戻す
@@ -18,9 +20,9 @@ rewrite_trial.py
     # サーバーなしの空回し
     .venv/bin/python src/rewrite_trial.py --dry-run --start outputs/llm_memory_trial/llm_gemma4-12b_N100_seed42_v2 \\
         --groups 5 --max-rewrites 10 --tag dry
-    # 本番
+    # 本番（選ぶ範囲を広く → 狭く）
     .venv/bin/python src/rewrite_trial.py --start outputs/llm_memory_trial/llm_gemma4-12b_N100_seed42_v2 \\
-        --model-tag gemma4-12b --groups 5 0 --extra-json '{"top_k": 64}'
+        --model-tag gemma4-12b --groups 5 0 --select shrink --tag shrink --extra-json '{"top_k": 64}'
 
 出力（outputs/rewrite_trial/{stem}/）
 
@@ -31,7 +33,9 @@ rewrite_trial.py
 
 ```mermaid
 flowchart TD
-    S["np.load(start)['X']<br/>X (N, 96)"] --> PICK["pick_person(X, target, part, recent)<br/>j"]
+    S["np.load(start)['X']<br/>X (N, 96)"] --> SC["removal_scores(X, target, part)<br/>scores (N,)"]
+    W["select_width(t, max_rewrites, m_start, m_end)<br/>m_t"] --> PICK["pick_person(scores, recent, m_t, rng)<br/>上位 m_t から一様に j"]
+    SC --> PICK
     PICK --> REST["X_rest = X から j を抜く"]
     REST --> MEM["memory_day_text(X_rest, ...)<br/>person_conditions(X_rest, ..., n_people=N)"]
     MEM --> MSG["rewrite_messages(d, X[j], memory)"]
@@ -41,7 +45,7 @@ flowchart TD
     ACC -- no --> KEEP["X はそのまま"]
     UPD --> STOP{"時刻別 MAE ≤ 床<br/>または max_rewrites 回"}
     KEEP --> STOP
-    STOP -- no --> PICK
+    STOP -- no --> SC
 ```
 """
 import argparse
@@ -73,18 +77,17 @@ def fit_error(X: npt.NDArray[np.integer], target: npt.NDArray[np.float64],
     return rate, day
 
 
-def pick_person(X: npt.NDArray[np.integer], target: npt.NDArray[np.float64], part: npt.NDArray[np.float64],
-                recent: set[int]) -> int:
-    """抜いたときに時刻別 MAE と日次 MAE の和が最も下がる人を選ぶ（recent に入っている人は除く）
+def removal_scores(X: npt.NDArray[np.integer], target: npt.NDArray[np.float64],
+                   part: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """1 人ずつ抜いたときの、時刻別 MAE と日次 MAE の和（ポイント）。小さいほど、その人が差に効いている
 
     Args:
         X: (N, 96) いまの集団
         target: (20, 96) 時刻別行動者率の公表値
         part: (20,) 日次行動者率の公表値
-        recent: 直近に書き直しを試した人の番号
 
     Returns:
-        選んだ人の番号 j
+        scores (N,)
     """
     n = len(X)
     onehot = (np.asarray(X)[:, None, :] == np.arange(tg.NUM_ACT20)[None, :, None])     # (N, 20, 96)
@@ -92,12 +95,33 @@ def pick_person(X: npt.NDArray[np.integer], target: npt.NDArray[np.float64], par
     slot_sum, day_sum = onehot.sum(axis=0), present.sum(axis=0)
     rate_wo = (slot_sum[None] - onehot) / (n - 1)                                       # (N, 20, 96)
     day_wo = (day_sum[None] - present) / (n - 1)                                        # (N, 20)
-    score = (np.abs(rate_wo - target[None]).mean(axis=(1, 2)) + np.abs(day_wo - part[None]).mean(axis=1)) * 100
-    order = np.argsort(score, kind="stable")
-    for j in order:
-        if int(j) not in recent:
-            return int(j)
-    return int(order[0])
+    return (np.abs(rate_wo - target[None]).mean(axis=(1, 2)) + np.abs(day_wo - part[None]).mean(axis=1)) * 100
+
+
+def select_width(t: int, max_rewrites: int, m_start: int, m_end: int) -> int:
+    """t 回目（0 始まり）に選ぶ範囲の人数 m_t。m_start から m_end へ幾何的に狭める（SA の冷却と同じ形）"""
+    if max_rewrites <= 1:
+        return m_end
+    return max(1, int(round(m_start * (m_end / m_start) ** (t / (max_rewrites - 1)))))
+
+
+def pick_person(scores: npt.NDArray[np.float64], recent: set[int], m: int, rng: np.random.Generator) -> int:
+    """recent を除き、scores の小さい順の上位 m 人から一様に 1 人選ぶ。m = 1 なら和が最も下がる人
+
+    Args:
+        scores: (N,) removal_scores の値
+        recent: 直近に書き直しを試した人の番号
+        m: 選ぶ範囲の人数
+        rng: 選ぶための乱数
+
+    Returns:
+        選んだ人の番号 j。全員が recent に入っているときは scores が最小の人
+    """
+    order = [int(j) for j in np.argsort(scores, kind="stable") if int(j) not in recent]
+    if not order:
+        return int(np.argmin(scores))
+    top = order[:max(1, m)]
+    return top[int(rng.integers(len(top)))] if len(top) > 1 else top[0]
 
 
 def diary_text(row: npt.NDArray[np.integer]) -> str:
@@ -135,7 +159,8 @@ def rewrite_messages(d: int, row: npt.NDArray[np.integer], memory: str) -> list[
 
 def rewrite_group(d: int, X0: npt.NDArray[np.int8], target: npt.NDArray[np.float64], part: npt.NDArray[np.float64],
                   client: trial.Chat, seed: int, top_k: int, min_gap: float, person_lines: int, max_rewrites: int,
-                  cooldown: int, max_tries: int, log_path: Path) -> tuple[npt.NDArray[np.int8], list[dict[str, float]]]:
+                  cooldown: int, max_tries: int, log_path: Path, select: str = "best", select_start: int = 0,
+                  select_end: int = 1) -> tuple[npt.NDArray[np.int8], list[dict[str, float]]]:
     """1 群ぶんの書き直しを回す
 
     Args:
@@ -152,6 +177,9 @@ def rewrite_group(d: int, X0: npt.NDArray[np.int8], target: npt.NDArray[np.float
         cooldown: 直近この回数に試した人は選ばない
         max_tries: 形式が正しくないときにやり直す回数の上限
         log_path: 1 回 1 行の記録の書き出し先（jsonl）
+        select: "best"（常に和が最も下がる人）か "shrink"（上位 m_t 人から一様、m_t を広く → 狭く）
+        select_start: shrink の最初の m_t。0 なら N
+        select_end: shrink の最後の m_t
 
     Returns:
         書き直しを終えた X (N, 96) と、試した回数ごとの誤差の推移
@@ -160,17 +188,20 @@ def rewrite_group(d: int, X0: npt.NDArray[np.int8], target: npt.NDArray[np.float
     n_people = len(X)
     floor = sm.floor_mae_pt(target, n_people)
     rng = np.random.default_rng([seed, d, 99])
+    pick_rng = np.random.default_rng([seed, d, 98])
+    m_start = select_start or n_people
     told = np.zeros((n_people, tg.NUM_ACT20), dtype=np.int8)
     rate, day = fit_error(X, target, part)
     curve = [{"rewrites": 0.0, "accepted": 0.0, "rate_mae_pt": rate, "part_mae_pt": day,
-              "violations_mean": float(sr.violations(X).mean())}]
+              "violations_mean": float(sr.violations(X).mean()), "width": 0.0, "distinct_tried": 0.0}]
     recent: list[int] = []
     n_accepted = 0
     with open(log_path, "w", encoding="utf-8") as log:
         for t in range(max_rewrites):
             if rate <= floor:
                 break
-            j = pick_person(X, target, part, set(recent[-cooldown:]))
+            m = 1 if select == "best" else select_width(t, max_rewrites, m_start, select_end)
+            j = pick_person(removal_scores(X, target, part), set(recent[-cooldown:]), m, pick_rng)
             X_rest = np.delete(X, j, axis=0)
             u = rng.random(tg.NUM_ACT20)
             conds = trial.person_conditions(X_rest, target, part, n_people, told[:n_people - 1], u, person_lines,
@@ -199,16 +230,17 @@ def rewrite_group(d: int, X0: npt.NDArray[np.int8], target: npt.NDArray[np.float
                 n_accepted += 1
             recent.append(j)
             curve.append({"rewrites": float(t + 1), "accepted": float(n_accepted), "rate_mae_pt": rate,
-                          "part_mae_pt": day, "violations_mean": float(sr.violations(X).mean())})
+                          "part_mae_pt": day, "violations_mean": float(sr.violations(X).mean()), "width": float(m),
+                          "distinct_tried": float(len(set(recent)))})
             sec = time.time() - t0
-            log.write(json.dumps({"group": d, "t": t, "person": j, "accepted": bool(accepted),
+            log.write(json.dumps({"group": d, "t": t, "person": j, "width": m, "accepted": bool(accepted),
                                   "before": [curve[-2]["rate_mae_pt"], curve[-2]["part_mae_pt"]],
                                   "candidate": [rate_new, day_new], "violations_old": int(sr.person_violation(X0[j])),
                                   "violations_new": int(sr.person_violation(row)), "tries": tries,
                                   "repaired": bool(problem), "seconds": round(sec, 2), "memory": memory,
                                   "conditions": conds, "content": content, **meta}, ensure_ascii=False) + "\n")
             log.flush()
-            print(f"[rewrite] 群 {d:02d} {t + 1:>4}/{max_rewrites}  人 {j:>3}  {'採る ' if accepted else '戻す '}"
+            print(f"[rewrite] 群 {d:02d} {t + 1:>4}/{max_rewrites}  幅 {m:>3}  人 {j:>3}  {'採る ' if accepted else '戻す '}"
                   f"時刻別 {rate:.3f}  日次 {day:.3f}  {sec:5.1f} 秒", flush=True)
     return X, curve
 
@@ -222,6 +254,10 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-rewrites", type=int, default=100, help="群あたり試す回数の上限")
     ap.add_argument("--cooldown", type=int, default=10, help="直近この回数に試した人は選ばない")
+    ap.add_argument("--select", choices=["best", "shrink"], default="best",
+                    help="best: 和が最も下がる人。shrink: 上位 m_t 人から一様、m_t を広く → 狭く")
+    ap.add_argument("--select-start", type=int, default=0, help="shrink の最初の m_t（0 なら群の人数）")
+    ap.add_argument("--select-end", type=int, default=1, help="shrink の最後の m_t")
     ap.add_argument("--top-k", type=int, default=6)
     ap.add_argument("--min-gap", type=float, default=0.03)
     ap.add_argument("--person-lines", type=int, default=5)
@@ -257,19 +293,21 @@ def main() -> None:
         t0 = time.time()
         X, curve = rewrite_group(d, X0, target, part, client, args.seed, args.top_k, args.min_gap, args.person_lines,
                                  args.max_rewrites, args.cooldown, args.max_tries,
-                                 out_dir / f"group{d:02d}_rewrite.jsonl")
+                                 out_dir / f"group{d:02d}_rewrite.jsonl", args.select, args.select_start,
+                                 args.select_end)
         np.savez_compressed(out_dir / f"group{d:02d}_rewrite.npz", X=X)
         for when, Xs in (("before", X0), ("after", X)):
             summary.append({"stem": stem, "group": d, "when": when, "n_people": len(Xs),
                             "rewrites": curve[-1]["rewrites"] if when == "after" else 0.0,
                             "accepted": curve[-1]["accepted"] if when == "after" else 0.0,
                             "changed_people": float((Xs != X0).any(axis=1).sum()),
+                            "distinct_tried": curve[-1]["distinct_tried"] if when == "after" else 0.0,
                             "floor_mae_pt": sm.floor_mae_pt(target, len(Xs)), **sm.evaluate(Xs, target, part),
                             **sm.rule_metrics(Xs), "minutes": (time.time() - t0) / 60 if when == "after" else 0.0})
         curves += [{"stem": stem, "group": d, **row} for row in curve]
         pd.DataFrame(summary).to_csv(out_dir / "summary.csv", index=False)
         pd.DataFrame(curves).to_csv(out_dir / "curve.csv", index=False)
-    cols = ["group", "when", "rewrites", "accepted", "changed_people", "rate_mae_pt", "floor_mae_pt", "part_mae_pt",
+    cols = ["group", "when", "rewrites", "accepted", "distinct_tried", "changed_people", "rate_mae_pt", "floor_mae_pt", "part_mae_pt",
             "switches_mean", "violations_mean", "violation_share"]
     print(pd.DataFrame(summary)[cols].round(3).to_string(index=False), flush=True)
     print(f"[rewrite] 書いた: {out_dir}", flush=True)

@@ -33,7 +33,7 @@ flowchart LR
 |---|---|
 | `src/llm_memory_trial.py` | 試行の本体。LLM には OpenAI 互換の API（llama.cpp の `llama-server` など）でつなぐ |
 | `src/schedule_metrics.py` | 採点の指標。較正に使う 2 表、評価だけに残す表（起床・就寝）、系列、R1〜R4 の違反、条件に従った割合 |
-| `src/rewrite_trial.py` | 作業 D。llm_memory_trial の出力を出発点に、差に最も効いている人を LLM に書き直させ、較正の 2 表との差が下がれば採る |
+| `src/rewrite_trial.py` | 作業 D。llm_memory_trial の出力を出発点に、差に効いている人を LLM に書き直させ、較正の 2 表との差が下がれば採る。`--select shrink` で選ぶ範囲を SA のように広く → 狭くする |
 | `src/score_pools.py` | LLM・SA・DGM（2 段階学習）の生成物を同じ指標で採点し、1 つの CSV に書く |
 | `src/stula_targets.py` | 集計表 2 つを 28 群 × 20 活動の配列で読む。DomainTransfer_trial の `sa_targets.py` からの写し |
 | `src/stula_derived_times.py` | 公表の規則で起床・就寝時刻を決め、平均時刻編の公表値を読む。DomainTransfer_trial の `src/eval` などからの写し |
@@ -68,7 +68,7 @@ uv sync    # pyproject.toml・uv.lock から .venv を作る（Python 3.14）
 
 # 書き直し（作業 D）。出発点は v2 の memory_person
 .venv/bin/python src/rewrite_trial.py --start outputs/llm_memory_trial/llm_gemma4-12b_N100_seed42_v2 \
-    --model-tag gemma4-12b --groups 5 0 --extra-json '{"top_k": 64}'
+    --model-tag gemma4-12b --groups 5 0 --select shrink --tag shrink --extra-json '{"top_k": 64}'
 
 # 採点（LLM の出力フォルダと SA の pool を並べる）
 .venv/bin/python src/score_pools.py --llm outputs/llm_memory_trial/llm_gemma4-12b_N100_seed42 \
